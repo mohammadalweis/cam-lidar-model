@@ -13,8 +13,7 @@ from cam_lidar_model.data import SensorBundle
 from cam_lidar_model.data.nuplan_mini_dataset import NuPlanMiniDataset
 from cam_lidar_model.models.mvp_model import MVPAutonomyModel
 from cam_lidar_model.training.losses import detection_loss, prediction_loss
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from cam_lidar_model.training.training_board import TrainingBoard, get_default_board
 
 
 class Trainer:
@@ -26,19 +25,22 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
         lr: float = 1e-4,
-        device: torch.device = device,
+        weight_decay: float = 0.0,
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         log_every: int = 10,
         checkpoints_dir: Path | str = Path("checkpoints"),
+        lambda_pred: float = 0.1,
     ) -> None:
         self.model = model.to(device)
         self.loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.device = device
         self.log_every = max(1, log_every)
         self.checkpoints_dir = Path(checkpoints_dir)
         self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
         self.best_val_loss: Optional[float] = None
+        self.lambda_pred = lambda_pred
 
     def train_step(self, batch: Dict[str, SensorBundle]) -> Dict[str, float]:
         """Single training step placeholder using SensorBundle inputs."""
@@ -59,8 +61,7 @@ class Trainer:
         detection_outputs = outputs["perception"]["detection"]
         loss_det = detection_loss(detection_outputs["heatmap_logits"], batch["labels"]["bev_heatmap"].to(self.device))
         loss_pred, ade, fde, pos_loss, heading_loss, speed_loss = prediction_loss(outputs["prediction"], prediction_targets)
-        lambda_pred = 0.1
-        total_loss = loss_det + lambda_pred * loss_pred
+        total_loss = loss_det + self.lambda_pred * loss_pred
         total_loss.backward()
         self.optimizer.step()
         return {
@@ -217,42 +218,66 @@ def _default_data_root() -> Path:
 def main() -> None:
     """Tiny smoke-training entrypoint over real nuPlan-mini camera data."""
 
+    board: TrainingBoard = get_default_board()
+
     parser = argparse.ArgumentParser(description="Run a tiny training loop on nuPlan-mini camera data.")
-    parser.add_argument("--data-root", type=Path, default=_default_data_root(), help="Path to nuPlan-mini root.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Dataloader batch size.")
-    parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers.")
-    parser.add_argument("--max-batches", type=int, default=2, help="Number of batches to run per epoch.")
+    parser.add_argument("--data-root", type=str, default=None, help="Path to nuPlan-mini root.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Dataloader batch size.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers.")
+    parser.add_argument("--max-batches", type=int, default=None, help="Number of batches to run per epoch.")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs to train.")
+    parser.add_argument("--device", type=str, default=None, help="Device string (e.g., 'cuda' or 'cpu').")
     args = parser.parse_args()
 
-    print(f"Training on device: {device}")
+    if args.data_root is not None:
+        board.data_root = args.data_root
+    if args.batch_size is not None:
+        board.batch_size = args.batch_size
+    if args.num_workers is not None:
+        board.num_workers = args.num_workers
+    if args.max_batches is not None:
+        board.max_batches = args.max_batches
+    if args.epochs is not None:
+        board.epochs = args.epochs
+    if args.device is not None:
+        board.device = args.device
 
-    train_dataset = NuPlanMiniDataset(data_root=str(args.data_root), split="train")
-    val_dataset = NuPlanMiniDataset(data_root=str(args.data_root), split="val")
+    torch.manual_seed(board.seed)
+
+    device_cfg = torch.device(board.device)
+    print(f"Training on device: {device_cfg}")
+
+    train_dataset = NuPlanMiniDataset(data_root=str(board.data_root), split="train")
+    val_dataset = NuPlanMiniDataset(data_root=str(board.data_root), split="val")
 
     # Limit the dataset so the smoke pass stays fast.
-    if args.max_batches is not None and args.max_batches > 0:
-        subset_size = min(len(train_dataset), args.max_batches * max(args.batch_size, 1))
+    if board.max_batches is not None and board.max_batches > 0:
+        subset_size = min(len(train_dataset), board.max_batches * max(board.batch_size, 1))
         train_dataset = torch.utils.data.Subset(train_dataset, list(range(subset_size)))  # type: ignore[arg-type]
-        val_subset_size = min(len(val_dataset), max(1, args.max_batches))
+        val_subset_size = min(len(val_dataset), max(1, board.max_batches))
         val_dataset = torch.utils.data.Subset(val_dataset, list(range(val_subset_size)))  # type: ignore[arg-type]
 
     collate_fn = lambda batch: batch[0]  # noqa: E731 - simple pass-through for single-sample batches
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate_fn
+        train_dataset, batch_size=board.batch_size, num_workers=board.num_workers, collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate_fn
+        val_dataset, batch_size=board.batch_size, num_workers=board.num_workers, collate_fn=collate_fn
     )
-    model = MVPAutonomyModel().to(device)
+    model = MVPAutonomyModel().to(device_cfg)
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        device=device,
+        device=device_cfg,
         log_every=1,
-        checkpoints_dir=Path("checkpoints"),
+        checkpoints_dir=Path(board.checkpoints_dir),
+        lr=board.lr,
+        weight_decay=board.weight_decay,
+        lambda_pred=board.lambda_pred,
     )
-    trainer.fit(epochs=1, max_batches=args.max_batches)
+    max_batches = None if board.max_batches is None or board.max_batches < 0 else board.max_batches
+    trainer.fit(epochs=board.epochs, max_batches=max_batches)
 
 
 if __name__ == "__main__":
